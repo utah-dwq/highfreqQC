@@ -1,0 +1,373 @@
+---
+title: "High Frequency QC"
+author: "Elise Hinman"
+date: '2022-06-07'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required packages
+The packages below run the programs needed to QC the high frequency dataset.
+```{r, packages, message=FALSE}
+library(zoo)
+library(plotly)
+library(leaflet)
+library(tidyverse)
+```
+
+## Dataset information
+The code blocks below are filled in by the user prior to building the RMarkdown QC report. They include site metadata, calibration, and nonreal value information.
+
+### Site metadata
+```{r, eval=F, echo=F}
+### MANUALLY FILL OUT THE 'meta' CODE BLOCK BELOW
+
+### NOTE Parameters currently supported include: 
+### c("Temperature","Specific conductance","pH","DO saturation","DO concentration","Turbidity")
+
+### Each parameter in your dataset should correspond to a column of the same name, with each row in the column filled with parameter values for a given date.
+```
+
+```{r,meta}
+#================================================================================
+filepath = "All_2021_4991820_JORDAN R AT CUDAHY LANE AB S DAVIS S WWTP_Raw.csv"
+
+sitename = "Jordan River at Cudahy Lane above South Davis WWTP"
+siteid = "4991820"
+lat_long = c(40.842037, -111.951142)
+
+parameters = c("Temperature","Specific conductance","pH","DO saturation","DO concentration","Turbidity")
+#================================================================================
+```
+
+### Calibration information
+```{r, eval=F, echo=F}
+### MANUALLY FILL OUT THE 'calibration_1' and (if applicable) 'calibration_2' CODE BLOCKS BELOW
+### CURRENTLY ACCOMMODATES 1-2 CALIBRATION REPORTS 
+### If multiple calibrations performed, enter calibrations in chronological order, with the earlier event entered first.
+### Enter in the date, time, calibration standard(s) and sonde readings before/after calibration
+### If you do not have calibration reports for certain parameters, comment out the lines using the pound sign (#)
+### Cannot calibrate temperature on sondes at this time
+```
+
+```{r, calibration_1}
+## CALIBRATION 1 SPECS
+#===============================================================================
+cal_date = "03/24/2021 17:45"
+
+# Specific conductance
+spC_val = 1543
+spC_cal = 1413
+
+# pH
+pH_val = 7.46
+pH_cal = 7
+# pH_val2 = 10.36
+# pH_cal2 = 10
+
+# Turbidity
+turb_val = -2.6
+turb_cal = 0
+
+# DO Saturation
+DOsat_val = 94
+DOsat_cal = 100
+
+# DO Concentration
+DOconc_val = NA
+DOconc_cal = NA
+
+# Temperature
+temp_val = NA
+temp_cal = NA
+#===============================================================================
+cal_values = data.frame(
+  Parameter = c("Specific conductance","pH","Turbidity","DO saturation","DO concentration","Temperature"),
+  std = c(spC_cal,pH_cal,turb_cal,DOsat_cal,DOconc_cal,temp_cal),
+  val = c(spC_val,pH_val,turb_val,DOsat_val,DOconc_val,temp_val)
+)
+cal_values = subset(cal_values, !is.na(cal_values$std))
+cal_1 = list()
+cal_1$date = cal_date
+cal_1$std_val = cal_values
+rm(spC_cal,pH_cal,turb_cal,DOsat_cal,DOconc_cal,temp_cal,spC_val,pH_val,turb_val,DOsat_val,DOconc_val,temp_val)
+```
+
+```{r, calibration_2}
+# ## CALIBRATION 2 SPECS
+# #===============================================================================
+cal_date = NA # if not NA, un-comment and fill in all lines below
+# 
+# # Specific conductance
+# spC_val = NA
+# spC_cal = NA
+# 
+# # pH
+# pH_val = NA
+# pH_cal = NA
+# 
+# # Turbidity
+# turb_val = NA
+# turb_cal = NA
+# 
+# # DO Saturation
+# DOsat_val = NA
+# DOsat_cal = NA
+# 
+# # DO Concentration
+# DOconc_val = NA
+# DOconc_cal = NA
+# 
+# # Temperature
+# temp_val = NA
+# temp_cal = NA
+# #===============================================================================
+if(is.na(cal_date)){
+  cal_2 = list(date=NA)
+}else{
+cal_values = data.frame(
+Parameter = c("Specific conductance","pH","Turbidity","DO saturation","DO concentration","Temperature"),
+std = c(spC_cal,pH_cal,turb_cal,DOsat_cal,DOconc_cal,temp_cal),
+val = c(spC_val,pH_val,turb_val,DOsat_val,DOconc_val,temp_val)
+)
+cal_2 = list()
+cal_2$date = cal_date
+cal_2$std_val = cal_values}
+```
+
+### Nonreal value limits
+```{r, eval=F, echo=F}
+### MANUALLY FILL OUT THE 'nonreal' CODE BLOCK BELOW
+### Lower and upper limits for nonreal values may be manually adjusted
+```
+
+```{r, nonreal}
+#================================================================================
+Temperature = c(-10,100)
+Specific_conductance = c(0, 16000)
+pH = c(0,14)
+DO_saturation = c(0,500)
+DO_conc = c(0,50)
+Turbidity = c(0,5000)
+#================================================================================
+```
+
+### Interpolation specs
+```{r, eval=F, echo=F}
+### Manually edit the frequency at which the sonde collects data in minutes (every 15 minutes, every 30 minutes, every hour, etc.)
+### Manually specify the max gap allowable to interpolate between two points.
+```
+
+```{r, spec_interp}
+#================================================================================
+frequency = 15
+max_gap = 2
+#================================================================================
+```
+
+## Data upload to long format
+```{r, longify}
+dat = readr::read_csv(filepath,col_names = c("LOCAL_DATETIME","UTC_OFFSET","UTC_DATETIME",parameters), 
+                      col_types = c("c","n","c",rep("n",length(parameters))), skip=3)
+dat_long = tidyr::pivot_longer(dat, cols = all_of(parameters), names_to = "Parameter")
+dat_long$Date = lubridate::mdy_hm(dat_long$UTC_DATETIME)
+dat_long = dat_long%>%
+  mutate(units = dplyr::recode(Parameter, "Temperature"="dC","Specific conductance"="uS/cm","pH"="None","DO saturation"="%", "DO concentration"="mg/L","Turbidity"="NTU"))%>%rename(value_raw = value)
+
+head(dat_long)
+```
+### Map and timeseries
+Quick look at the location and raw data. An interactive plotly plot is saved to the working directory with all of the raw data for each parameter.
+```{r, map, echo=FALSE}
+m = wqTools::baseMap()%>%
+  setView(lng=lat_long[2],lat=lat_long[1], zoom=8, options = list())%>%
+  addCircleMarkers(lng=lat_long[2],lat=lat_long[1], color="#034963", popup = paste0(
+    "Site ID: ", siteid,
+    "<br>Site Name: ", sitename,
+    "<br>Parameters: ", paste(parameters, collapse=", ")
+  ))
+m
+```
+
+```{r, rawplot, echo=FALSE, message=FALSE,warning=FALSE, fig.width=12, fig.height=10}
+p = plotly::plot_ly(data=dat_long, x=~Date, y=~value_raw, color=~Parameter, type="scatter", mode="lines+markers")
+htmlwidgets::saveWidget(p, file = paste0(sitename,"_RawData_Plot.html"))
+ggplot2::ggplot(data=dat_long, aes(Date, value_raw))+geom_line(color="#034963")+geom_point(color="#034963")+labs(y="Raw Value",x="Date")+facet_wrap(~Parameter, scales="free")
+```
+
+## QC Step 1: Drift Correction
+Document when calibrations were performed on which parameters for use in the drift correction step. Drift correction equations taken from the [driftR package](https://rdrr.io/cran/driftR/f/vignettes/driftR.Rmd), developed by Andrew Shaughnessy, Christopher Prener, and Elizabeth Hasenmueller. EDH has an email out to Elizabeth Hasenmueller on 5/17/22 clarifying the format of the two-point correction, since it does not behave as expected.
+
+```{r, cal_adjust1, message=FALSE,warning=FALSE, fig.width=12, fig.height=10}
+end_datetime1 = lubridate::mdy_hm(cal_1$date)+lubridate::hours(7)
+
+cal_dat = subset(dat_long, dat_long$Date<end_datetime1&dat_long$Parameter%in%cal_1$std_val$Parameter)
+cal_dat$numTime = as.numeric(cal_dat$Date)
+cal_dat$totTime = max(cal_dat$numTime)-min(cal_dat$numTime)
+cal_dat$corrFac = (cal_dat$numTime-min(cal_dat$numTime))/cal_dat$totTime
+
+cal_num = cal_1$std_val%>%group_by(Parameter)%>%mutate(cal_count=length(std))
+
+# Single-point correction
+cal_single = subset(cal_num, cal_num$cal_count==1)
+single_cal = subset(cal_dat, cal_dat$Parameter%in%cal_single$Parameter)
+single_cal = merge(cal_dat, cal_single, all.x = TRUE)
+single_cal1 = single_cal%>%mutate(value.corr = value_raw+(corrFac*(std-val)))
+single_cal1$drift_note = "Corrected for instrument drift"
+
+# Two-point correction
+cal_dbl = subset(cal_num, cal_num$cal_count==2)
+if(dim(cal_dbl)[1]>0){
+  double_cal = subset(cal_dat, cal_dat$Parameter%in%cal_dbl$Parameter)
+double_cal = merge(double_cal, cal_dbl, all.x = TRUE)
+cal_dbl_wide = cal_dbl%>%pivot_wider(id_cols=Parameter,names_from = std, values_from=c(std, val))
+
+double_cal1 = merge(double_cal, cal_dbl_wide, all.x = TRUE)
+double_cal1$low = double_cal1$std_7+(double_cal1$corrFac*(double_cal1$std_7-double_cal1$val_7))
+double_cal1$high = double_cal1$std_10-(double_cal1$corrFac*(double_cal1$std_10-double_cal1$val_10))
+double_cal1$value.corr = (((double_cal1$value_raw-double_cal1$low)/(double_cal1$high-double_cal1$low))*(double_cal1$std_10-double_cal1$std_7))+double_cal1$std_7
+double_cal1$drift_note = "Corrected for instrument drift"
+
+drift_corr1 = plyr::rbind.fill(single_cal1, double_cal1)
+}else{
+  drift_corr1 = single_cal1
+}
+
+drift_corr_long = drift_corr1%>%pivot_longer(c(value_raw, value.corr), names_to = "type", values_to = "value")
+corrp = ggplot2::ggplot(data=drift_corr_long,aes(x=Date,y=value, color=type))+geom_line()+geom_point()+labs(title="Drift Correction Plots",color="")+scale_color_manual(labels = c("Corrected Value","Original Value"), values=c("#646464","#034963"))+facet_wrap(.~Parameter, nrow=6, scales = "free_y")
+corrp
+```
+
+```{r, cal_adjust2, message=FALSE,warning=FALSE, fig.width=12, fig.height=10}
+if(!is.na(cal_2$date)){
+end_datetime2 = lubridate::mdy_hm(cal_2$date)+lubridate::hours(7)
+
+cal_dat = subset(dat_long, dat_long$Date>end_datetime1&dat_long$Date<end_datetime2&dat_long$Parameter%in%cal_1$std_val$Parameter)
+cal_dat$numTime = as.numeric(cal_dat$Date)
+cal_dat$totTime = max(cal_dat$numTime)-min(cal_dat$numTime)
+cal_dat$corrFac = (cal_dat$numTime-min(cal_dat$numTime))/cal_dat$totTime
+
+cal_num = cal_2$std_val%>%group_by(Parameter)%>%mutate(cal_count=length(std))
+
+# Single-point correction
+cal_single = subset(cal_num, cal_num$cal_count==1)
+single_cal = subset(cal_dat, cal_dat$Parameter%in%cal_single$Parameter)
+single_cal = merge(cal_dat, cal_single, all.x = TRUE)
+single_cal1 = single_cal%>%mutate(value.corr = value_raw+(corrFac*(std-val)))
+single_cal1$drift_note = "Corrected for instrument drift"
+
+# Two-point correction
+cal_dbl = subset(cal_num, cal_num$cal_count==2)
+if(dim(cal_dbl)[1]>0){
+  double_cal = subset(cal_dat, cal_dat$Parameter%in%cal_dbl$Parameter)
+double_cal = merge(double_cal, cal_dbl, all.x = TRUE)
+cal_dbl_wide = cal_dbl%>%pivot_wider(id_cols=Parameter,names_from = std, values_from=c(std, val))
+
+double_cal1 = merge(double_cal, cal_dbl_wide, all.x = TRUE)
+double_cal1$low = double_cal1$std_7+(double_cal1$corrFac*(double_cal1$std_7-double_cal1$val_7))
+double_cal1$high = double_cal1$std_10-(double_cal1$corrFac*(double_cal1$std_10-double_cal1$val_10))
+double_cal1$value.corr = (((double_cal1$value_raw-double_cal1$low)/(double_cal1$high-double_cal1$low))*(double_cal1$std_10-double_cal1$std_7))+double_cal1$std_7
+double_cal1$drift_note = "Corrected for instrument drift"
+
+drift_corr2 = plyr::rbind.fill(single_cal1, double_cal1)
+}else{
+  drift_corr2 = single_cal1
+}
+
+drift_corr_long = drift_corr2%>%pivot_longer(c(value_raw, value.corr), names_to = "type", values_to = "value")
+corrp = ggplot2::ggplot(data=drift_corr_long,aes(x=Date,y=value, color=type))+geom_line()+geom_point()+labs(title="Drift Correction Plots",color="")+scale_color_manual(labels = c("Corrected Value","Original Value"), values=c("#646464","#034963"))+facet_wrap(.~Parameter, nrow=3, scales = "free_y")
+corrp
+}else{drift_corr2 = data.frame()}
+
+```
+
+```{r, drift-combine}
+drift_corr = plyr::rbind.fill(drift_corr1, drift_corr2)
+dat_long1 = merge(dat_long, drift_corr, all.x = TRUE)
+dat_long1$value.1 = ifelse(!is.na(dat_long1$value.corr), dat_long1$value.corr, dat_long1$value_raw)
+rm(drift_corr, drift_corr_long, drift_corr1, drift_corr2, cal_1, cal_2, cal_dat, cal_dbl, cal_num,cal_single, cal_values, single_cal, single_cal1)
+```
+
+## QC Step 2: Remove Non-Real Values
+Specify the mininum and maximum real value limits for each parameter.
+Apply limits to dataset and convert updated result value to NA if it falls outside of the allowable range.
+
+```{r, nonreal-remove}
+limits = data.frame(Parameter=c("Temperature","Specific conductance","pH","DO saturation","DO concentration","Turbidity"), min = c(Temperature[1],Specific_conductance[1],pH[1],DO_saturation[1],DO_conc[1],Turbidity[1]), max=c(Temperature[2],Specific_conductance[2],pH[2],DO_saturation[2],DO_conc[2],Turbidity[2]))
+
+rm(Temperature,Specific_conductance,pH, DO_conc, DO_saturation, Turbidity)
+
+dat_long2 = merge(dat_long1, limits, all.x=TRUE)
+dat_long2$value.2 = ifelse(dat_long2$value.1<dat_long2$min|dat_long2$value.1>dat_long2$max,NA,dat_long2$value.1)
+dat_long2$ex_value_note = ifelse(is.na(dat_long2$value.2)&!is.na(dat_long2$value.1),"Value Removed - Erroneous",NA)
+head(dat_long2[order(dat_long2$ex_value_note),])
+```
+
+## QC Step 3: Interpolate gaps of missing values
+Specify the frequency of data collection and the maximum gap allowable to interpolate between two points.
+
+### Load interpolation function
+```{r, interp_func}
+# future addition: interpolation method - linear, polynomial, etc.
+source("intGap.R")
+# intGap <- function(x,col,by,maxg){
+#   byt = paste0(by," mins")
+#   names(x)[names(x)==col] = "intv"
+#   y = data.frame(Date = seq(min(x$Date),max(x$Date),by=byt))
+#   z = merge(x,y,all=TRUE)
+#   z = z[order(z$Date),]
+#   z$Parameter = unique(x$Parameter)
+#   z$units = unique(x$units)
+#   z$value.int = zoo::na.approx(z$intv,maxgap = maxg)
+#   z$interpolation_note = ifelse(is.na(z$intv)&!is.na(z$value.int),"Interpolated",NA)
+#   names(z)[names(z)=="intv"] = col
+#   return(z)
+# }
+```
+
+### Apply interpolation function by parameter
+```{r, int_data, message=FALSE}
+dat_long3 = dat_long2%>%group_by(Parameter)%>%dplyr::group_map(~intGap(.x,"value.2",by=frequency,maxg=max_gap),.keep=TRUE)%>%plyr::rbind.fill()
+names(dat_long3)[names(dat_long3)=="value.int"] = "value.3"
+```
+
+## Save and plot data
+High frequency dataset is saved in a long format with the file extension .Rdata. This code chunk produces plotly .html plots in the working directory for each parameter, showing the raw data as well as the drift corrected, removed, and interpolated points.
+```{r, save_data, message=FALSE, warning=FALSE,fig.width=12, fig.height=14}
+save(dat_long, dat_long3, file = "data_cleaned_v2.Rdata")
+
+g = ggplot2::ggplot(data=dat_long3, aes(x=Date,y=value.3, color=interpolation_note))+geom_point()+labs(title="Interpolation Plots",color="")+scale_color_manual(labels = c("Interpolated","Not Interpolated"), values=c("red","gray"))+facet_wrap(.~Parameter, nrow=6, scales="free")
+g
+
+params = unique(dat_long3$Parameter)
+for(i in 1:length(params)){
+  dat = subset(dat_long3, dat_long3$Parameter==params[i])
+  raw = data.frame(Date = dat$Date, Value = dat$value_raw, Type = "Raw")
+  drift = subset(dat, !is.na(dat$drift_note))[,c("Date","value.corr")]
+  if(dim(drift)[1]>0){
+    names(drift) = c("Date","Value")
+    drift$Type="Drift Corrected"
+  }
+  error = subset(dat, !is.na(dat$ex_value_note))[,c("Date","value.1")]
+  if(dim(error)[1]>0){
+    names(error) = c("Date","Value")
+    error$Type="Removed - Erroneous Value"
+  }
+  int = subset(dat, !is.na(dat$interpolation_note))[,c("Date","value.3")]
+  if(dim(int)[1]>0){
+    names(int) = c("Date","Value")
+    int$Type = "Interpolated"
+  }
+  plotd = plyr::rbind.fill(raw,drift,error,int)
+  plotd$Type = factor(plotd$Type, levels=c("Raw","Drift Corrected","Removed - Erroneous Value","Interpolated"))
+  palette = data.frame(Type=c("Raw","Drift Corrected","Removed - Erroneous Value","Interpolated"), color=c("gray","green","red","orange"))
+  plotd = merge(plotd,palette, all.x = TRUE)
+  cols = unique(plotd$color)
+  g = plotly::plot_ly(data=plotd,x=~Date,y=~Value, name=~Type, type="scatter",mode="markers")%>%layout(title = params[i])
+  htmlwidgets::saveWidget(g,file=paste0(params[i],"_",sitename,"_QCplot.html"))
+}
+```
+
