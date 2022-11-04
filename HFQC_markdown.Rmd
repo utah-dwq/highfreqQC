@@ -97,6 +97,7 @@ DOconc_cal = NA
 temp_val = NA
 temp_cal = NA
 #===============================================================================
+# Create calibration dataframe from values provided above
 cal_values = data.frame(
   Parameter = c("Specific conductance","pH","pH","Turbidity","DO saturation","DO concentration","Temperature"),
   std = c(spC_cal,pH_cal,pH_cal2,turb_cal,DOsat_cal,DOconc_cal,temp_cal),
@@ -186,19 +187,24 @@ max_gap = 2
 ## Data upload to long format
 The first step is to read in the data from the excel spreadsheet and get the dates into the correct format for use in the rest of the script. This section also creates columns for the parameter name and unit name in preparation of conversion to long format. When the dataset is in a long format, each row represents a unique measurement observation in time. If multiple parameters values were recorded at a single point of time, each parameter value will have its own row.
 ```{r, longify}
+# Read in the dataset provided at the filepath above, defining the format of columns using readr.
 dat = readr::read_csv(filepath,col_names = c("LOCAL_DATETIME","UTC_OFFSET","UTC_DATETIME",parameters), 
                       col_types = c("c","n","c",rep("n",length(parameters))), skip=3)
+# Flatten by parameter
 dat_long = tidyr::pivot_longer(dat, cols = all_of(parameters), names_to = "Parameter")
+# Convert date to one that R recognizes.
 dat_long$Date = lubridate::mdy_hm(dat_long$UTC_DATETIME)
+# Create column with units for each parameter.
 dat_long = dat_long%>%
   mutate(units = dplyr::recode(Parameter, "Temperature"="dC","Specific conductance"="uS/cm","pH"="None","DO saturation"="%", "DO concentration"="mg/L","Turbidity"="NTU"))%>%rename(value_raw = value)
-
+# Create unique sample id for each record in the dataset.
 dat_long$sampID = seq(100000,(nrow(dat_long)+99999), by=1)
 head(dat_long)
 ```
 ### Map and timeseries
 Quick look at the location and raw data. An interactive plotly plot is saved to the working directory with all of the raw data for each parameter.
 ```{r, map, echo=FALSE}
+# Produce a map that shows where the sonde is located and its name (provided above)
 m = wqTools::baseMap()%>%
   setView(lng=lat_long[2],lat=lat_long[1], zoom=8, options = list())%>%
   addCircleMarkers(lng=lat_long[2],lat=lat_long[1], color="#034963", popup = paste0(
@@ -210,6 +216,7 @@ m
 ```
 
 ```{r, rawplot, echo=FALSE, message=FALSE,warning=FALSE}
+# Produces an interactive plotly plot in the same folder as this markdown with all raw values plotted on the same graph.
 p = plotly::plot_ly(data=dat_long, x=~Date, y=~value_raw, color=~Parameter, type="scatter", mode="lines+markers")
 htmlwidgets::saveWidget(p, file = paste0(sitename,"_RawData_Plot.html"))
 ```
@@ -217,10 +224,15 @@ htmlwidgets::saveWidget(p, file = paste0(sitename,"_RawData_Plot.html"))
 ## QC Step 1: Flag suspect zero values
 Often, zero values represent sonde malfunctions. Zeroes in the dataset then affect interpolation values. The current suggested method for dealing with possibly erroneous values is to run a simple "if else" script, where if the median of the dataset is above the value specified at the beginning of this document, all zeroes are flagged as questionable and removed from the dataset and the interpolation calculation. At this time, the value is not parameter specific, but certainly could be in a future release.
 ```{r}
+# Get the median of each parameter
 param_meds = dat_long%>%group_by(Parameter)%>%summarise(median = median(value_raw, na.rm = TRUE))
+# Find all parameters with median values above the median threshold value provided above in the fill-in section (default is 1)
 param_rmv = subset(param_meds, param_meds$median>median_abv)$Parameter
+# Add a column to the dataset to hold all values that make it through this first screen
 dat_long1 = dat_long%>%add_column(value.1 = NA)
+# If the dataset median value is above the threshold, get rid of all zero values in the dataset.
 dat_long1$value.1 = ifelse(dat_long1$Parameter%in%param_rmv&dat_long1$value_raw==0,NA,dat_long1$value_raw)
+# Note explaining the screen performed.
 dat_long1$zero_note = ifelse(dat_long1$Parameter%in%param_rmv&dat_long1$value_raw==0,"Zero removed from dataset because median is above specified threshold",NA)
 ```
 
@@ -228,13 +240,17 @@ dat_long1$zero_note = ifelse(dat_long1$Parameter%in%param_rmv&dat_long1$value_ra
 Document when calibrations were performed on which parameters for use in the drift correction step. Drift correction equations taken from the [driftR package](https://rdrr.io/cran/driftR/f/vignettes/driftR.Rmd), developed by Andrew Shaughnessy, Christopher Prener, and Elizabeth Hasenmueller. EDH recently identified an error in the driftR package equations and brought this to the attention of the developer. It will be updated and corrected in a future version of the package. For now, the script below contains replicated (corrected) equations from the package.
 
 ```{r, cal_adjust1, message=FALSE,warning=FALSE, fig.width=12, fig.height=10}
+# Convert calibration time date to UTC to avoid time change issues.
 end_datetime1 = lubridate::mdy_hm(cal_1$date)+lubridate::hours(7)
 
+# Find the section of the dataset represented by the time period between calibrations.
 cal_dat = subset(dat_long1, dat_long1$Date<end_datetime1&dat_long1$Parameter%in%cal_1$std_val$Parameter)
+# Calculate a time correlation term that takes into account how far a datapoint is from its previous calibration point. 
 cal_dat$numTime = as.numeric(cal_dat$Date)
 cal_dat$totTime = max(cal_dat$numTime)-min(cal_dat$numTime)
 cal_dat$corrFac = (cal_dat$numTime-min(cal_dat$numTime))/cal_dat$totTime
 
+# Dataframe containing the number of calibration points by parameter. Most are a single-point calibration, but pH can be a two point calibration.
 cal_num = cal_1$std_val%>%group_by(Parameter)%>%mutate(cal_count=length(std))
 
 # Single-point correction
@@ -247,13 +263,18 @@ single_cal1$drift_note = "Corrected for instrument drift"
 # Two-point correction
 cal_dbl = subset(cal_num, cal_num$cal_count==2)
 if(dim(cal_dbl)[1]>0){
+# Subset to datase that uses a two point calibration (pH)
 double_cal = subset(cal_dat, cal_dat$Parameter%in%cal_dbl$Parameter)
 # double_cal = merge(double_cal, cal_dbl, all.x = TRUE)
+# Widen the table containing the two point calibration standards, since both are used in the calibration drift equation
 cal_dbl_wide = cal_dbl%>%pivot_wider(id_cols=Parameter,names_from = std, values_from=c(std, val))
 
 double_cal1 = merge(double_cal, cal_dbl_wide, all.x = TRUE)
+# Calibration value from the low standard
 double_cal1$low = double_cal1$std_7-(double_cal1$corrFac*(double_cal1$std_7-double_cal1$val_7))
+# Calibration value from the high standard
 double_cal1$high = double_cal1$std_10-(double_cal1$corrFac*(double_cal1$std_10-double_cal1$val_10))
+# Actual drift corrected value uses both
 double_cal1$value.corr = (((double_cal1$value.1-double_cal1$low)/(double_cal1$high-double_cal1$low))*(double_cal1$std_10-double_cal1$std_7))+double_cal1$std_7
 double_cal1$drift_note = "Corrected for instrument drift"
 
@@ -302,8 +323,11 @@ drift_corr2 = plyr::rbind.fill(single_cal1, double_cal1)
 ```
 
 ```{r, drift-combine}
+# Combine multiple drift-corrected datasets (if applicable)
 drift_corr = plyr::rbind.fill(drift_corr1, drift_corr2)
+# Merge drift corrected datasets to original dataset - this is a new data object
 dat_long2 = merge(dat_long1, drift_corr, all.x = TRUE)
+# Create result value column that will show the updated drift-corrected value if the datapoint went through the drift screen. Otherwise, the data value remains the same.
 dat_long2$value.2 = ifelse(!is.na(dat_long2$value.corr), dat_long2$value.corr, dat_long2$value.1)
 rm(drift_corr, drift_corr_long, drift_corr1, drift_corr2, cal_1, cal_2, cal_dat, cal_dbl, cal_num,cal_single, cal_values, single_cal, single_cal1)
 ```
@@ -313,12 +337,16 @@ Specify the mininum and maximum real value limits for each parameter.
 Apply limits to dataset and convert updated result value to NA if it falls outside of the allowable range.
 
 ```{r, nonreal-remove}
+# Create dataset with nonreal value limits provided at top of markdown document.
 limits = data.frame(Parameter=c("Temperature","Specific conductance","pH","DO saturation","DO concentration","Turbidity"), min = c(Temperature[1],Specific_conductance[1],pH[1],DO_saturation[1],DO_conc[1],Turbidity[1]), max=c(Temperature[2],Specific_conductance[2],pH[2],DO_saturation[2],DO_conc[2],Turbidity[2]))
 
 rm(Temperature,Specific_conductance,pH, DO_conc, DO_saturation, Turbidity)
 
+# Merge latest dataset to limits - creates a new object
 dat_long3 = merge(dat_long2, limits, all.x=TRUE)
+# Create new value column that converts extreme values above or below thresholds to NA
 dat_long3$value.3 = ifelse(dat_long3$value.2<dat_long3$min|dat_long3$value.2>dat_long3$max,NA,dat_long3$value.2)
+# Create a note explaining why value was converted to NA
 dat_long3$ex_value_note = ifelse(is.na(dat_long3$value.3)&!is.na(dat_long3$value.2),"Value Removed - Erroneous",NA)
 head(dat_long3[order(dat_long3$ex_value_note),])
 ```
@@ -328,7 +356,9 @@ Specify the frequency of data collection and the maximum gap allowable to interp
 ### Load interpolation function
 ```{r, interp_func}
 # future addition: interpolation method - linear, polynomial, etc.
+# This pulls in a function that is its own R script in the same folder as this markdown document. The function is also commented out below, but I figured it might be nice to have a standalone interpolation function for uses outside this markdown.
 source("intGap.R")
+# The function creates a list of date times that represents a "complete" dataset. This list is then merged to the dataset, and in places where measurements are missing, an NA will be populated. It then uses the zoo package to interpolate between points separated by an allowable gap in the data.
 # intGap <- function(x,col,by,maxg){
 #   byt = paste0(by," mins")
 #   names(x)[names(x)==col] = "intv"
@@ -346,15 +376,20 @@ source("intGap.R")
 
 ### Apply interpolation function by parameter
 ```{r, int_data, message=FALSE}
+# Apply the interpolation function by parameter to the latest dataset, creating a new column with the updated values.
 dat_long4 = dat_long3%>%group_by(Parameter)%>%dplyr::group_map(~intGap(.x,"value.3",by=frequency,maxg=max_gap),.keep=TRUE)%>%plyr::rbind.fill()
 names(dat_long4)[names(dat_long4)=="value.int"] = "value.4"
 check = nrow(dat_long4)
 
+# This adds a sample ID to newly created interpolated values.
 max_id = max(dat_long4$sampID, na.rm = TRUE)
 needid = subset(dat_long4, is.na(dat_long4$sampID))
 needid$sampID = seq(max_id+1, max_id+nrow(needid), by=1)
 
+# Pull out datapoints with sample ID 
 dat_id = subset(dat_long4, !is.na(dat_long4$sampID))
+
+# Add the new interpolated values with their sample IDs to the existing dataset that has sample IDs
 dat_long4 = plyr::rbind.fill(dat_id, needid)
 
 if(!check==nrow(dat_long4))stop("Dataframe dimensions changed when assigning IDs to interpolated values.")
@@ -367,6 +402,7 @@ save(dat_long, dat_long4, file = "data_cleaned_v3.Rdata")
 ```
 
 ```{r, all_data_plots, message=FALSE, warning=FALSE,fig.width=12, fig.height=14}
+# The code below compares the raw and QC'd datasets in plots that are displayed in the markdown and saved to their own plotly plots in the same folder as this markdown document.
 # OG
 raw = subset(dat_long4, !is.na(dat_long4$value_raw))
 raw$value_plot = raw$value_raw
