@@ -1,0 +1,620 @@
+# Goal interpolate the data where values are missing.
+#Load packages
+```{r}
+library(bigrquery)
+library(dplyr)
+#library(DBI)
+library(data.table)
+library(glue)
+
+
+#Authenticate
+bq_auth()
+
+# Define your GCP project and dataset
+project_id <- "ut-deq-highfreq-dev"
+dataset_id <- "AO_HF_Testing"
+
+bqQuery <- function(query){
+  project_id <- "ut-deq-highfreq-dev"
+  query_job <- bq_project_query(project_id, query)
+  table <- bq_table_download(query_job)
+  return(table)
+}
+
+query1 <- "SELECT * FROM `ut-deq-highfreq-dev.AO_HF_Testing.temp_DO_collection_intervals`"
+collection_intervals <- bqQuery(query1)
+# Only DateTime_Local > Date(2018,10,01) for Temperature and Dissolved Oxygen
+# CREATE OR REPLACE TABLE `ut-deq-highfreq-dev.AO_HF_Testing.temp_DO_IR26_time_diff` AS
+#  SELECT *,TIMESTAMP_DIFF(DateTime_Local,LAG(DateTime_Local) OVER (PARTITION BY Sample_ID, Measurement_Description ORDER BY DateTime_Local),MINUTE) AS Previous_Timestamp_Diff 
+# FROM `ut-deq-highfreq-dev.AO_HF_Testing.temp_DO_IR26_QC` 
+
+#Query to get summary statistics to target which Sample_IDs may need to be reviewed.
+# CREATE OR REPLACE TABLE `ut-deq-highfreq-dev.AO_HF_Testing.temp_DO_IR26_time_diff` AS
+# SELECT *,  Water_Measurement - LAG(Water_Measurement) OVER (PARTITION BY Sample_ID, Measurement_Description ORDER BY DateTime_Local) AS Water_Measurement_Diff
+# FROM `ut-deq-highfreq-dev.AO_HF_Testing.temp_DO_IR26_time_diff`
+# ORDER BY  Sample_ID, Measurement_Description, DateTime_Local
+
+query <- "
+   SELECT
+    Sample_ID,
+    HF_Location_ID,
+    DateTime_Local,
+    Water_Measurement,
+    Measurement_Description,
+    Water_Measurement_Diff
+FROM
+    `ut-deq-highfreq-dev.AO_HF_Testing.temp_DO_IR26_time_diff`
+WHERE Water_Measurement_Diff IS NOT NULL
+ORDER BY
+    Sample_ID,
+    HF_Location_ID,
+    Measurement_Description;
+"
+water_meas_diff <- bqQuery(query)
+
+```
+
+#Interpolate Function
+```{r}
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(data.table)
+
+water_meas_diff_int <- water_meas_diff
+# Convert dataset to data.table for efficient filtering
+setDT(water_meas_diff_int)
+setDT(collection_intervals)
+
+# Merge collection interval with QC data
+water_meas_diff_int <- merge(water_meas_diff_int, collection_intervals, by = c("Sample_ID", "Measurement_Description"), all.x = TRUE)
+
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(data.table)
+
+# Convert datasets to data.table for efficient operations
+setDT(water_meas_diff1)
+setDT(collection_intervals)
+
+# Merge collection interval information
+water_meas_diff2 <- merge(water_meas_diff1, collection_intervals, by = c("Sample_ID", "Measurement_Description"), all.x = TRUE)
+
+# Define interpolation function
+interpolate_data <- function(data) {
+  # Ensure data is sorted by time
+  data <- data[order(DateTime_Local)]
+  
+  # Get expected collection interval for this Sample_ID & Measurement_Description
+  interval <- unique(data$Mode_Time_Difference_Minutes)
+  if (is.na(interval) | length(interval) == 0) return(data)  # Skip if no interval info
+
+  # Generate a complete sequence of timestamps at the expected interval
+  complete_dates <- data.table(DateTime_Local = seq(min(data$DateTime_Local, na.rm = TRUE),
+                                                    max(data$DateTime_Local, na.rm = TRUE),
+                                                    by = paste(interval, "mins")))
+  
+  # Merge the complete sequence with existing data to find missing timestamps
+  merged_data <- merge(complete_dates, data, by = "DateTime_Local", all.x = TRUE)
+  
+  # Identify time gaps
+  merged_data[, time_diff := as.numeric(difftime(lead(DateTime_Local), DateTime_Local, units = "mins"))]
+  
+  # Interpolate only where:
+  # - The value is missing (`is.na(Water_Measurement)`)
+  # - The gap is **≤ 30 minutes**
+  # - The surrounding values are NOT flagged as outliers
+  merged_data[, Water_Measurement_Interpolated := ifelse(
+    is.na(Water_Measurement) & (time_diff <= 30) & !lag(is_outlier, default = FALSE) & !lead(is_outlier, default = FALSE),
+    na.approx(Water_Measurement, na.rm = FALSE),
+    Water_Measurement
+  )]
+
+  # Create a QC flag for interpolated values
+  merged_data[, Interpolation_Flag := ifelse(is.na(Water_Measurement) & !is.na(Water_Measurement_Interpolated), "Interpolated", NA)]
+  
+  # Drop temporary columns
+  merged_data[, time_diff := NULL]
+
+  return(merged_data)
+}
+
+# Apply function to each (Sample_ID, Measurement_Description) group
+interpolated_water_data <- water_meas_diff2[, interpolate_data(.SD), by = .(Sample_ID, Measurement_Description)]
+
+# Convert back to data.frame if needed
+interpolated_water_data <- as.data.frame(interpolated_water_data)
+
+# Save for review
+save(interpolated_water_data, file = "interpolated_water_data.RData")
+load("interpolated_water_data.RData")
+getwd()
+review_interp <- interpolated_water_data%>%mutate(diff_int = ifelse(Water_Measurement_Interpolated!=Water_Measurement,1,0))%>%
+  filter(diff_int==1)
+
+
+```
+
+
+
+```{r}
+
+water_meas_diff1 <- water_meas_diff %>%
+  mutate(winter = ifelse(month(DateTime_Local)%in%c(11,12,1,2),1,0))%>%
+  group_by(Sample_ID, HF_Location_ID,winter, Measurement_Description) %>%
+  mutate(mean_value = mean(Water_Measurement, na.rm = TRUE),
+    std_dev = sd(Water_Measurement, na.rm = TRUE),
+    z_score = (Water_Measurement_Diff - mean(Water_Measurement_Diff, na.rm = TRUE)) / sd(Water_Measurement_Diff, na.rm = TRUE),
+        is_outlier = abs(z_score) > 7
+  ) %>%
+  ungroup()
+
+
+
+outlier_3_4 <- water_meas_diff1%>%filter(abs(z_score)>3.5)
+
+# Identify potential sensor errors with extreme z-scores
+outlier_samples <- water_meas_diff %>%
+  filter(abs(z_score) > 3)  # Common threshold for outliers
+
+# Identify Sensor Anomolies
+sensor_anomalies <- water_meas_diff %>%
+  group_by(Sample_ID, HF_Location_ID, Measurement_Description) %>%
+  summarise(
+    avg_diff = mean(Water_Measurement_Diff, na.rm = TRUE),
+    min_diff = min(Water_Measurement_Diff, na.rm = TRUE),
+    max_diff = max(Water_Measurement_Diff, na.rm = TRUE),
+    std_dev = sd(Water_Measurement_Diff, na.rm = TRUE)
+  ) %>%
+  mutate(
+    threshold_high = avg_diff + (2 * std_dev),
+    threshold_low = avg_diff - (2 * std_dev)
+  ) %>%
+  ungroup()
+
+# Identify where values exceed normal ranges
+water_meas_diff_anomol <- water_meas_diff %>%
+  inner_join(sensor_anomalies, by = c("Sample_ID", "HF_Location_ID", "Measurement_Description")) %>%
+  mutate(anomoly = ifelse(Water_Measurement_Diff > threshold_high | Water_Measurement_Diff < threshold_low,1,0))
+
+outlier_qc_review <- read_csv("~/Documents/GitHub/highfreqQC/HF_interpolation/QC_Review_Sample30_493_outlier2_99_2025-03-06.csv")
+
+outlier_qc_review1 <-outlier_qc_review%>%
+  group_by(Measurement_Description,QC_Flag)%>%
+  summarize(avg_z = mean(z_score),
+            avg_diff = mean(Water_Measurement_Diff),
+            avg_meas = mean(Water_Measurement),
+            counts = n())
+
+library(ggplot2)
+
+plot = ggplot(outlier_qc_review, aes(x = Measurement_Description, y =z_score, fill = QC_Flag)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Potentially Erroneous" = "red", "OK" = "blue")) +
+  theme_minimal() +
+  labs(title = "QC Review: Measurement Distributions", 
+       x = "Measurement Type", 
+       y = "Water Measurement", 
+       fill = "QC Flag") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+plot
+
+ggplot(outlier_qc_review, aes(x = z_score, fill = QC_Flag)) +
+  geom_density(alpha = 0.5) +  # Transparency for overlapping densities
+  facet_wrap(~Measurement_Description, scales = "free") +  # Separate plots per measurement
+  scale_fill_manual(values = c("Potentially Erroneous" = "red", "OK" = "blue")) +
+  theme_minimal() +
+  labs(title = "Distribution of Measurements by QC Flag", 
+       x = "Water Measurement", 
+       y = "Density", 
+       fill = "QC Flag")
+
+
+```
+
+
+#Shiny App to view outlier values 
+```{r}
+library(shiny)
+library(plotly)
+library(dplyr)
+library(data.table)
+library(lubridate)
+library(DT)
+library(data.table)
+outlier_sample_ids <- water_meas_diff1 %>%
+  group_by(Sample_ID, Measurement_Description) %>%
+  summarise(has_outlier = any(is_outlier), .groups = "drop") %>%
+  filter(has_outlier) %>%
+  select(Sample_ID, Measurement_Description)
+
+# Keep only rows where Sample_ID and Measurement_Description match the outlier list
+sample_data <- water_meas_diff1 %>%
+  inner_join(outlier_sample_ids, by = c("Sample_ID", "Measurement_Description"))
+
+
+# Convert to data.table
+setDT(sample_data)
+
+# Set keys for fast filtering
+setkey(sample_data, Sample_ID, Measurement_Description, DateTime_Local)
+
+save(sample_data,file="/outlier_bg_app/outlier_sample_data.Rdata")
+
+temp_sample_data <-sample_data%>%filter(Measurement_Description=="Water Temperature")
+save(temp_sample_data,file="/Users/alanochoa/Documents/GitHub/highfreqQC/HF_interpolation/outlier_bq_app/outlier_temperature_data.Rdata")
+
+
+#Create UID for samples
+names(temp_sample_data)
+
+```
+# Filter for only data in the critical periods
+```{r}
+#Keep Sample IDs only when there is a is_outlier == TRUE and that outlier is in months of c(5,6,7,8,9)
+crit_period_temp_sample_data<- temp_sample_data%>%
+  mutate(month = month(DateTime_Local),
+         c_p = ifelse(is_outlier==TRUE& month%in%c(6,7,8,9),1,0),
+         )%>%
+    group_by(Sample_ID)%>%
+  mutate(keep = any(c_p))%>%
+  filter(keep==TRUE)
+
+critical_season_temp <- crit_period_temp_sample_data %>%
+  select(-keep,-c_p,-month)
+
+print(length(unique(crit_period_temp_sample_data$Sample_ID)))
+
+save(critical_season_temp,file="/Users/alanochoa/Documents/GitHub/highfreqQC/HF_interpolation/outlier_bq_app/critical_season_temp.Rdata")
+load("/Users/alanochoa/Documents/GitHub/highfreqQC/HF_interpolation/outlier_bq_app/critical_season_temp.Rdata")
+```
+#Pull weather data from NOAA
+```{r}
+library(wqTools)
+noaa_sites <-read.csv("noaa_weather_UT_sites.csv")
+
+noaa_sites1 <- noaa_sites%>%
+  select(-source_url,-etl_timestamp)%>%
+  rename(LatitudeMeasure = latitude,LongitudeMeasure = longitude)%>%
+  assignAUs(.)%>%
+  assignHUCs()
+
+unique_temp_sites <- unique(critical_season_temp$HF_Location_ID)
+
+# Define your GCP project and dataset
+project_id <- "ut-deq-highfreq-dev"
+
+bqQuery <- function(project,query){
+  project_id <- project
+  query_job <- bq_project_query(project_id, query)
+  table <- bq_table_download(query_job)
+  return(table)
+}
+
+query1 <- "SELECT * FROM `ut-deq-highfreq-dev.High_Frequency_Flat_Views.Flatview_Location_Sampling_Event`"
+
+location_sampling_events <- bqQuery(project_id,query1)
+
+startDate <- as.character(as.Date(min(critical_season_temp[critical_season_temp$Sample_ID==29,]$DateTime_Local)))
+endDate <- as.character(as.Date(max(critical_season_temp[critical_season_temp$Sample_ID==29,]$DateTime_Local)))
+str(startDate)
+query2 <- glue("SELECT
+  *
+FROM
+  `ut-gee-dwq-uir-dev`.`noaa_weather_data`.`noaa_weather`
+WHERE
+  element IN ('PRCP',
+    'SNOW',
+    'TMAX',
+    'TMIN',
+    'TAVG')
+  AND id IN ('US1UTBE0002',
+    'US1UTBE0005')
+  AND date BETWEEN '{startDate}'
+  AND '{endDate}';")
+
+test_data <- bqQuery(project_id,query2)
+
+print(query2)
+library(tidyverse)
+library(leaflet) 
+
+temperature_sites <- location_sampling_events%>%
+  filter(HF_Location_ID%in%unique_temp_sites,State=="UT") %>%
+  select(-ToolTip,-Folder_Link,-wqDataLiveID,-County, -Raw_Data_Folder_Link,-BigQuery_Entered,-Sample_ID,-Year_Deployed,-Logger_ID,-Collecting_Org)%>%
+  distinct(.)%>%
+  separate(LatLong,c("LatitudeMeasure", "LongitudeMeasure"),sep=",")%>%
+  rename(MonitoringLocationName =Logger_Location_Description,MonitoringLocationIdentifier = HF_Location_ID,MonitoringLocationTypeName=Water_Name)%>%
+  mutate(LatitudeMeasure = as.numeric(LatitudeMeasure),
+         LongitudeMeasure = as.numeric(LongitudeMeasure))%>%
+  assignHUCs(.)%>%
+  assignAUs()
+
+noaa_sites2 <- noaa_sites1%>%filter(HUC8%in%temperature_sites$HUC8)
+
+library(geosphere)
+
+# Define the radius in meters (10 miles)
+radius_m <- 10 * 1609.34  # 16093.4 meters
+
+# For each NOAA site, calculate its distance to every temperature site,
+# then keep the minimum distance.
+noaa_sites2_filtered <- noaa_sites2 %>%
+  rowwise() %>%
+  mutate(
+    min_distance = min(
+      distHaversine(
+        cbind(LongitudeMeasure, LatitudeMeasure),
+        cbind(temperature_sites$LongitudeMeasure, temperature_sites$LatitudeMeasure)
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  filter(min_distance <= radius_m)
+
+# View the filtered NOAA sites
+print(noaa_sites2_filtered)
+
+#****** Download the noaa data_summary
+query <- "SELECT * FROM `ut-gee-dwq-uir-dev.noaa_weather_data.data_summary`"
+
+noaa_data_summaries <-bqQuery("ut-gee-dwq-uir-dev",query)
+
+au_poly_trimmed <-wqTools::au_poly%>%filter(ASSESS_ID%in%noaa_sites2_filtered$ASSESS_ID|ASSESS_ID%in%temperature_sites$ASSESS_ID)
+huc8_trimmed <- wqTools::huc8_poly%>%filter(HUC8%in%noaa_sites2_filtered$HUC8|HUC8%in%temperature_sites$HUC8)
+huc12_trimmed <- wqTools::huc12_poly%>%filter(HUC12%in%noaa_sites2_filtered$HUC12|HUC12%in%temperature_sites$HUC12)
+
+map1 = leaflet() %>%
+  addMapPane( "underlay_polygons", zIndex = 410)%>%
+  addMapPane( "au_poly", zIndex = 415)%>%
+  addMapPane( "markers", zIndex = 420)%>%
+  addProviderTiles( "Esri.WorldTopoMap", 
+      group = "Topo", options = providerTileOptions(updateWhenZooming = FALSE, 
+        updateWhenIdle = TRUE))%>%
+  addCircleMarkers( lat = temperature_sites$LatitudeMeasure, 
+      lng = temperature_sites$LongitudeMeasure, group = "Sites", color = "blue", 
+      opacity = 0.8, options = pathOptions(pane = "markers"), # layerId = temperature_sites$locationID,
+      popup = paste0("Location ID: ", temperature_sites$MonitoringLocationIdentifier, 
+        "<br> Name: ", temperature_sites$MonitoringLocationName, "<br> Type: ")
+      )%>%
+  addCircleMarkers( lat = noaa_sites2_filtered$LatitudeMeasure, 
+      lng = noaa_sites2_filtered$LongitudeMeasure, group = "Sites", color = "red", 
+      opacity = 0.8, options = pathOptions(pane = "markers"), # layerId = temperature_sites$locationID,
+      popup = paste0("Location ID: ", noaa_sites2_filtered$id, 
+        "<br> Elevation: ", noaa_sites2_filtered$elevation, "<br> Type: ")) %>%
+  addPolygons(
+    data = huc8_trimmed, group = "HUC8",
+    fillOpacity = 0.1, weight = 2, color = "purple",
+    options = pathOptions(pane = "underlay_polygons") ) %>%
+  addPolygons(
+    data = au_poly_trimmed,group = "Assessment Units",
+    fillOpacity = 0.1,weight = 2,color = "orange",
+    options = pathOptions(pane = "au_poly"),
+    popup = ~paste("AU Name:", AU_NAME, "<br> AU ID:", ASSESS_ID) ) %>%
+  addPolygons(
+    data = huc12_trimmed, group = "HUC12",
+    fillOpacity = 0.1, weight = 2, color = "brown",
+    options = pathOptions(pane = "underlay_polygons") )%>%
+  addLayersControl(
+    baseGroups = c("Topo"),  # You can add other base maps if desired
+    overlayGroups = c("Sites (Blue)", "Sites (Red)", "HUC8", "Assessment Units", "HUC12"),
+    options = layersControlOptions(collapsed = TRUE)
+  )
+
+map1
+
+
+save(noaa_data_summaries,huc12_trimmed,au_poly_trimmed,huc8_trimmed,noaa_sites2_filtered,temperature_sites,file="/Users/alanochoa/Documents/GitHub/highfreqQC/HF_interpolation/outlier_bq_app/outlier_map_objects.Rdata")
+
+load("/Users/alanochoa/Documents/GitHub/highfreqQC/HF_interpolation/outlier_bq_app/outlier_map_objects.Rdata")
+
+```
+
+
+
+
+# 2) Define what data would warrant interpolation: Assess eventID data then identify intervals of when the data is collected. Check for gaps of data, interpolate where gap max=2
+```{r}
+library(zoo)
+names(raw_data100)
+df_subset <- raw_data100 %>%
+  mutate(
+    DateTime_Local = as.POSIXct(DateTime_Local, format="%m/%d/%Y %H:%M:%S", tz="America/Denver")  # Ensure format matches
+  ) %>%
+  arrange(Sample_ID, Measurement_Description, DateTime_Local) %>%  # Ensure chronological order
+  group_by(Sample_ID,HF_Location_ID, Measurement_Description) %>%  # Interpolation per parameter
+  mutate(
+    Time_Diff = as.numeric(difftime(lead(DateTime_Local), DateTime_Local, units="mins"))  # Corrected
+  )
+ ,
+    Interpolated_Value = ifelse(
+      Time_Diff > 0 & Time_Diff <= (2 * 15),  # 15-min intervals, max gap = 2 intervals
+      na.approx(ResultMeasureValue, na.rm=FALSE), 
+      NA
+    )
+  ) %>%
+  ungroup()
+
+
+```
+
+#Download USGS sites to then query USGS API to pull weather data and flow data to compare against HF temperature data
+```{r}
+#****** To make it flexible may need to build API call to get list of sites from USGS to keep it up to date.
+query1 <- "SELECT * FROM `ut-deq-highfreq-dev.High_Frequency_Data_USGS.USGS_Instantaneous_Sites`"
+usgs_sites <- bqQuery(query1)
+
+#Step 1: When Sample_Index changes or when app starts, you will identify the USGS sites near (maybe a 10 mile buffer if any?) 
+library(geosphere)
+library(data.table)
+
+# Convert to data.table for speed 
+setDT(temperature_sites)
+setDT(usgs_sites)
+
+# Result container
+nearby_usgs <- list()
+
+# Distance threshold in meters (10 miles)
+threshold_meters <- 16093.4
+
+# Loop through each temperature site
+for (i in seq_len(nrow(temperature_sites))) {
+  temp_site <- temperature_sites[i]
+  temp_coords <- c(temp_site$LongitudeMeasure, temp_site$LatitudeMeasure)
+
+  # Calculate distances from current temp site to all USGS sites
+  distances <- distHaversine(temp_coords, usgs_sites[, .(Long, Lat)])
+  
+  usgs_sites[, distance := distances]
+  # Get nearby USGS sites
+  nearby <- usgs_sites[distances <= threshold_meters]
+  
+  # Add temperature site ID for reference
+  if (nrow(nearby) > 0) {
+    nearby[, temp_site_id := temp_site$MonitoringLocationIdentifier]
+    nearby_usgs[[length(nearby_usgs) + 1]] <- nearby
+  }
+}
+
+# Combine into a single data.table
+nearby_usgs_all <- rbindlist(nearby_usgs)
+
+
+# Step 2: and make an API call to get the min and max dates for flow and air temperature data. These USGS sites with data available near period of record will be plotted on the map with the NOAA sites.
+library(httr)
+library(jsonlite)
+
+
+nearby_usgs_param_list <- list()
+
+for (site_i in nearby_usgs_all$site_no) {
+site_info <- paste0("https://waterservices.usgs.gov/nwis/iv/?format=json&sites=", site_i, "&parameterCd=all")
+response <- httr::GET(site_info)
+json_txt <- httr::content(response, as = "text", encoding = "UTF-8")
+data <- jsonlite::fromJSON(json_txt, flatten = TRUE)
+
+# print(data$value$timeSeries$variable.variableDescription)
+# print(data$value$timeSeries$variable.variableCode)
+# print(data$value$timeSeries$variable.variableName)
+
+param_dt <- data.table(site_no = site_i,
+  variableCode = sapply(data$value$timeSeries$variable.variableCode, function(x) x$value),
+  variableName = data$value$timeSeries$variable.variableName,
+  variableDescription = data$value$timeSeries$variable.variableDescription
+)
+nearby_usgs_param_list[[length(nearby_usgs_param_list) + 1]] <- param_dt
+
+}
+
+# Combine into a single data.table
+nearby_usgs_param_list_all <- rbindlist(nearby_usgs_param_list)
+
+nearby_usgs_param_list_all1 <- nearby_usgs_param_list_all %>% filter(variableDescription%in%c("Discharge, cubic feet per second" ,"Temperature, water, degrees Celsius" , "Precipitation, total, inches","Temperature, air, degrees Fahrenheit"))%>%
+  distinct()
+str(nearby_usgs_param_list_all1)
+
+
+nearby_usgs_all_2 <-nearby_usgs_all %>%filter(site_no%in%nearby_usgs_param_list_all1$site_no)
+
+save(nearby_usgs_param_list_all1,nearby_usgs_all_2,file="/Users/alanochoa/Documents/GitHub/highfreqQC/HF_interpolation/outlier_bq_app/usgs_site_data.Rdata")
+load("usgs_site_data.Rdata")
+#-------------------------------------------------------------
+
+download_USGS_data <- function(site_no,params,start,end) 
+  {
+site_no <- "10129300"
+params <- c("00060")  # flow and water temp
+start <- "2019-07-04"
+end <- "2022-10-22"
+
+url <- paste0(
+  "https://waterservices.usgs.gov/nwis/iv/?sites=", site_no,
+  "&parameterCd=", paste(params, collapse = ","),
+  "&startDT=", start,
+  "&endDT=", end,
+  "&format=json"
+)
+
+res <- fromJSON(content(GET(url), "text"))
+
+# Assuming `res` is your parsed JSON object (from fromJSON())
+p_length <- length(res$value$timeSeries$variable$variableCode)
+
+all_data <- list()  # Store individual tables
+
+for (i in seq_len(p_length)) {
+  print(i)
+  ts_entry <- res$value$timeSeries$values[[i]]
+  
+  # Extract metadata
+  variable_code <- res$value$timeSeries$variable$variableCode[[i]]$value
+  variable_desc <- res$value$timeSeries$variable$variableDescription[i]
+  site_id <- res$value$timeSeries$sourceInfo$siteCode[[1]]$value
+  unit <- res$value$timeSeries$variable$unit$unitCode[i]
+  
+  # Extract values (dateTime and value columns)
+  df <- as.data.table(ts_entry$value[[1]])  # Flatten
+  if (nrow(df) > 0) {
+    df[, variable_code := variable_code]
+    df[, variable_desc := variable_desc]
+    df[, site_id := site_id]
+    df[, unit := unit]
+    
+    # Combine into the master list
+    all_data[[i]] <- df
+  }
+}
+
+# Combine all into one data.table
+combined_data <- rbindlist(all_data, fill = TRUE)
+# Ensure dateTime is POSIXct in UTC
+combined_data[, dateTime := as.POSIXct(dateTime, format="%Y-%m-%dT%H:%M:%S", tz="UTC")]
+
+# Convert to MST/MDT (Mountain Time, auto handles DST)
+combined_data[, dateTime_local := with_tz(dateTime, tzone = "America/Denver")]
+  combined_data[, datetime_30min := floor_date(dateTime_local, unit = "30 minutes")]
+
+# Calculate average value per 30-minute window and variable
+combined_avg <- combined_data[
+  , .(mean_value = mean(as.numeric(value), na.rm = TRUE)),
+  by = .(site_id,datetime_30min, variable_code, variable_desc, unit)
+]
+return(combined_data)
+}
+
+# Step 3: There are still too many USGS sites that don't have data for specifc site of interest period of record. Will need to manually download all combinations:
+nearby_usgs_all_3 <- nearby_usgs_all_2%>%
+  select(-HF_Location_ID,-MLID,-Site_Type,-State,-County,-USGS_HUC12,-function_batch,-Sample_ID)%>%
+  rename(HF_Location_ID = temp_site_id)
+
+# Create a summary tab for all the Sample_ID,HF_Location_ID,date_min,date_max
+temperature_dates <- critical_season_temp%>%
+  group_by(Sample_ID,HF_Location_ID)%>%
+  summarize(min_date =min(DateTime_Local),
+            max_date = max(DateTime_Local))
+
+# merge nearby_usgs_all_3 with temperature_dates
+nearby_usgs_all_4 <- merge(nearby_usgs_all_3,temperature_dates,by ="HF_Location_ID" )
+
+```
+
+
+# 3) After data has been interpolated, push back or update to original duplicated_test_table. Research best route: 
+
+# R1) Remove working EventID from duplicated_test_table, and paste into temporary_backup_interpolated_table
+# R2) Leave all data in and when you push and update the table it only updates the rows where the EventID is the same{also build check to get count of new amounts of data}
+
+# R3) Are there any other possible routes that can be taken? 
+
+
+# 4) If this was a dashboard where you iterate through each EventID, this maybe helpful to review. The features could include:
+# a) Summary Table of EventIDs MinDate, MaxDate, List of Parameters for EventID, Record_Numbers, # b) User selects an event ID :below table or on side panel click there are buttons {Interpolate_all_params, Review_Interpolation } : 
+# c) Summary of previous record count vs new record count {by param level - site, param, counts}
+# d) Graph to display record values, {add filter by Parameter}, colorcode for interpolated values as red others as blue or similar. AND Add Previous, Next Record buttons to zoom into individual interpolated values.
+# e) What kind of additional stats can we add to easily view /flag potentially eroneous interpolated values? For example if we were to interpolate at a min or max?
+
+
+
